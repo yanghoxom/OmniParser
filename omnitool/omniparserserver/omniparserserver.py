@@ -1,10 +1,11 @@
 '''
-python -m omniparserserver --som_model_path ../../weights/icon_detect/model.pt --caption_model_name florence2 --caption_model_path ../../weights/icon_caption_florence --device cuda --BOX_TRESHOLD 0.05
+python -m omniparserserver --som_model_path ../../weights/icon_detect/model.pt --caption_model_name florence2 --caption_model_path ../../weights/icon_caption_florence --device cuda --BOX_TRESHOLD 0.05 --num_cores 32 --batch_size 256
 '''
 
 import sys
 import os
 import time
+import multiprocessing
 from fastapi import FastAPI
 from pydantic import BaseModel
 import argparse
@@ -22,6 +23,10 @@ def parse_arguments():
     parser.add_argument('--BOX_TRESHOLD', type=float, default=0.05, help='Threshold for box detection')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host for the API')
     parser.add_argument('--port', type=int, default=8000, help='Port for the API')
+    # Thêm tham số cho đa luồng và tối ưu
+    parser.add_argument('--num_cores', type=int, default=multiprocessing.cpu_count(), help='Number of CPU cores to use')
+    parser.add_argument('--max_workers', type=int, default=None, help='Maximum number of workers for thread pool')
+    parser.add_argument('--batch_size', type=int, default=None, help='Batch size for processing')
     args = parser.parse_args()
     return args
 
@@ -47,5 +52,16 @@ async def parse(parse_request: ParseRequest):
 async def root():
     return {"message": "Omniparser API ready"}
 
+@app.get("/info/")
+async def info():
+    """Trả về thông tin về cấu hình hiện tại của server"""
+    return {
+        "cores_configured": omniparser.num_cores,
+        "max_workers": omniparser.max_workers,
+        "batch_size": omniparser.optimal_batch_size,
+        "device": omniparser.config.get('device', 'cpu'),
+    }
+
 if __name__ == "__main__":
+    print(f"Starting server with {omniparser.num_cores} cores")
     uvicorn.run("omniparserserver:app", host=args.host, port=args.port, reload=True)

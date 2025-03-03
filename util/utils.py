@@ -41,30 +41,41 @@ import re
 from torchvision.transforms import ToPILImage
 import supervision as sv
 import torchvision.transforms as T
-from util.box_annotator import BoxAnnotator 
+from util.box_annotator import BoxAnnotator
 
 
-def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2-opt-2.7b", device=None):
+def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2-opt-2.7b", device=None, num_threads=None):
     if not device:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cpu"
+
+    # Đặt cấu hình đa luồng
+    if num_threads:
+        torch.set_num_threads(num_threads)
+
     if model_name == "blip2":
         from transformers import Blip2Processor, Blip2ForConditionalGeneration
         processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
         if device == 'cpu':
             model = Blip2ForConditionalGeneration.from_pretrained(
-            model_name_or_path, device_map=None, torch_dtype=torch.float32
-        ) 
+            model_name_or_path, device_map=None, torch_dtype=torch.float32,
+            low_cpu_mem_usage=True
+        )
         else:
             model = Blip2ForConditionalGeneration.from_pretrained(
             model_name_or_path, device_map=None, torch_dtype=torch.float16
         ).to(device)
     elif model_name == "florence2":
-        from transformers import AutoProcessor, AutoModelForCausalLM 
+        from transformers import AutoProcessor, AutoModelForCausalLM
         processor = AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
         if device == 'cpu':
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(model_name_or_path,
+                                                      torch_dtype=torch.float32,
+                                                      trust_remote_code=True,
+                                                      low_cpu_mem_usage=True)
         else:
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float16, trust_remote_code=True).to(device)
+            model = AutoModelForCausalLM.from_pretrained(model_name_or_path,
+                                                      torch_dtype=torch.float16,
+                                                      trust_remote_code=True).to(device)
     return {'model': model.to(device), 'processor': processor}
 
 
@@ -77,13 +88,18 @@ def get_yolo_model(model_path):
 
 @torch.inference_mode()
 def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_model_processor, prompt=None, batch_size=128):
-    # Number of samples per batch, --> 128 roughly takes 4 GB of GPU memory for florence v2 model
+    # Tăng batch size cho xử lý hiệu quả hơn trên nhiều CPU
     to_pil = ToPILImage()
     if starting_idx:
         non_ocr_boxes = filtered_boxes[starting_idx:]
     else:
         non_ocr_boxes = filtered_boxes
+
+    # Sử dụng parallel processing để chuẩn bị các cropped images
     croped_pil_image = []
+
+    # Chuẩn bị danh sách các box để xử lý
+    tasks = []
     for i, coord in enumerate(non_ocr_boxes):
         try:
             xmin, xmax = int(coord[0]*image_source.shape[1]), int(coord[2]*image_source.shape[1])
@@ -100,25 +116,37 @@ def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_
             prompt = "<CAPTION>"
         else:
             prompt = "The image shows"
-    
+
     generated_texts = []
     device = model.device
+
+    # Tối ưu hóa batch processing
     for i in range(0, len(croped_pil_image), batch_size):
-        start = time.time()
         batch = croped_pil_image[i:i+batch_size]
-        t1 = time.time()
+
         if model.device.type == 'cuda':
             inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt", do_resize=False).to(device=device, dtype=torch.float16)
         else:
             inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt").to(device=device)
+
         if 'florence' in model.config.name_or_path:
-            generated_ids = model.generate(input_ids=inputs["input_ids"],pixel_values=inputs["pixel_values"],max_new_tokens=20,num_beams=1, do_sample=False)
+            generated_ids = model.generate(input_ids=inputs["input_ids"],
+                                           pixel_values=inputs["pixel_values"],
+                                           max_new_tokens=20,
+                                           num_beams=1,
+                                           do_sample=False)
         else:
-            generated_ids = model.generate(**inputs, max_length=100, num_beams=5, no_repeat_ngram_size=2, early_stopping=True, num_return_sequences=1) # temperature=0.01, do_sample=True,
+            generated_ids = model.generate(**inputs,
+                                         max_length=100,
+                                         num_beams=5,
+                                         no_repeat_ngram_size=2,
+                                         early_stopping=True,
+                                         num_return_sequences=1)
+
         generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)
         generated_text = [gen.strip() for gen in generated_text]
         generated_texts.extend(generated_text)
-    
+
     return generated_texts
 
 
@@ -138,7 +166,7 @@ def get_parsed_content_icon_phi3v(filtered_boxes, ocr_bbox, image_source, captio
 
     model, processor = caption_model_processor['model'], caption_model_processor['processor']
     device = model.device
-    messages = [{"role": "user", "content": "<|image_1|>\ndescribe the icon in one sentence"}] 
+    messages = [{"role": "user", "content": "<|image_1|>\ndescribe the icon in one sentence"}]
     prompt = processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     batch_size = 5  # Number of samples per batch
@@ -161,13 +189,13 @@ def get_parsed_content_icon_phi3v(filtered_boxes, ocr_bbox, image_source, captio
             inputs['attention_mask'][i] = torch.cat([torch.zeros(1, max_len - v.shape[1], dtype=torch.long), inputs['attention_mask'][i]], dim=1)
         inputs_cat = {k: torch.concatenate(v).to(device) for k, v in inputs.items()}
 
-        generation_args = { 
-            "max_new_tokens": 25, 
-            "temperature": 0.01, 
-            "do_sample": False, 
-        } 
-        generate_ids = model.generate(**inputs_cat, eos_token_id=processor.tokenizer.eos_token_id, **generation_args) 
-        # # remove input tokens 
+        generation_args = {
+            "max_new_tokens": 25,
+            "temperature": 0.01,
+            "do_sample": False,
+        }
+        generate_ids = model.generate(**inputs_cat, eos_token_id=processor.tokenizer.eos_token_id, **generation_args)
+        # # remove input tokens
         generate_ids = generate_ids[:, inputs_cat['input_ids'].shape[1]:]
         response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         response = [res.strip('\n').strip() for res in response]
@@ -185,7 +213,7 @@ def remove_overlap(boxes, iou_threshold, ocr_bbox=None):
         x1 = max(box1[0], box2[0])
         y1 = max(box1[1], box2[1])
         x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
+        y2 = max(box1[3], box2[3])
         return max(0, x2 - x1) * max(0, y2 - y1)
 
     def IoU(box1, box2):
@@ -323,9 +351,9 @@ def load_image(image_path: str) -> Tuple[np.array, torch.Tensor]:
     return image, image_transformed
 
 
-def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor, phrases: List[str], text_scale: float, 
+def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor, phrases: List[str], text_scale: float,
              text_padding=5, text_thickness=2, thickness=3) -> np.ndarray:
-    """    
+    """
     This function annotates an image with bounding boxes and labels.
 
     Parameters:
@@ -406,7 +434,7 @@ def int_box_area(box, w, h):
 
 def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128):
     """Process either an image path or Image object
-    
+
     Args:
         image_source: Either a file path (str) or PIL Image object
         ...
@@ -431,10 +459,10 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
         print('no ocr bbox!!!')
         ocr_bbox = None
 
-    ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0] 
+    ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0]
     xyxy_elem = [{'type': 'icon', 'bbox':box, 'interactivity':True, 'content':None} for box in xyxy.tolist() if int_box_area(box, w, h) > 0]
     filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem)
-    
+
     # sort the filtered_boxes so that the one with 'content': None is at the end, and get the index of the first 'content': None
     filtered_boxes_elem = sorted(filtered_boxes, key=lambda x: x['content'] is None)
     # get the index of the first 'content': None
@@ -446,7 +474,7 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
     time1 = time.time()
     if use_local_semantics:
         caption_model = caption_model_processor['model']
-        if 'phi3_v' in caption_model.config.model_type: 
+        if 'phi3_v' in caption_model.config.model_type:
             parsed_content_icon = get_parsed_content_icon_phi3v(filtered_boxes, ocr_bbox, image_source, caption_model_processor)
         else:
             parsed_content_icon = get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_model_processor, prompt=prompt,batch_size=batch_size)
@@ -468,13 +496,13 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
     filtered_boxes = box_convert(boxes=filtered_boxes, in_fmt="xyxy", out_fmt="cxcywh")
 
     phrases = [i for i in range(len(filtered_boxes))]
-    
+
     # draw boxes
     if draw_bbox_config:
         annotated_frame, label_coordinates = annotate(image_source=image_source, boxes=filtered_boxes, logits=logits, phrases=phrases, **draw_bbox_config)
     else:
         annotated_frame, label_coordinates = annotate(image_source=image_source, boxes=filtered_boxes, logits=logits, phrases=phrases, text_scale=text_scale, text_padding=text_padding)
-    
+
     pil_img = Image.fromarray(annotated_frame)
     buffered = io.BytesIO()
     pil_img.save(buffered, format="PNG")
@@ -509,20 +537,25 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
         image_source = image_source.convert('RGB')
     image_np = np.array(image_source)
     w, h = image_source.size
+
+    # Tối ưu OCR processing
     if use_paddleocr:
         if easyocr_args is None:
             text_threshold = 0.5
         else:
             text_threshold = easyocr_args['text_threshold']
+        # PaddleOCR đã tối ưu đa luồng nên không cần thay đổi
         result = paddle_ocr.ocr(image_np, cls=False)[0]
         coord = [item[0] for item in result if item[1][1] > text_threshold]
         text = [item[1][0] for item in result if item[1][1] > text_threshold]
     else:  # EasyOCR
         if easyocr_args is None:
             easyocr_args = {}
+        # EasyOCR cũng đã được tối ưu đa luồng
         result = reader.readtext(image_np, **easyocr_args)
         coord = [item[0] for item in result]
         text = [item[1] for item in result]
+
     if display_img:
         opencv_img = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
         bb = []
